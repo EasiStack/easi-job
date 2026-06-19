@@ -227,3 +227,228 @@ impl Drop for JobSet {
         // `self.tasks` (a JoinSet) aborts any remaining tasks on drop.
     }
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{BoxError, FirstTick, job_fn};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Spawn a closure-job that increments `counter` per tick.
+    fn spawn_counting(
+        set: &mut JobSet,
+        name: &'static str,
+        every: Duration,
+        counter: Arc<AtomicUsize>,
+    ) {
+        set.periodic(
+            name,
+            Schedule::new(every).with_jitter(0.0),
+            job_fn(move |_ct| {
+                let c = counter.clone();
+                async move {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }),
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_joins_clean_jobs_within_grace() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut jobs = JobSet::new();
+        spawn_counting(&mut jobs, "a", Duration::from_secs(10), counter.clone());
+        spawn_counting(&mut jobs, "b", Duration::from_secs(10), counter.clone());
+        spawn_counting(&mut jobs, "c", Duration::from_secs(10), counter.clone());
+
+        // Three jobs × one tick each between t=10 and t=15
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 3, "one tick per job");
+
+        // Shutdown is near-instant — cancellation hits the inter-tick sleep
+        let shutdown = jobs.shutdown(Duration::from_secs(60));
+        let report = tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("clean cancellation should complete in zero virtual time");
+
+        assert_eq!(report.clean.len(), 3, "all 3 jobs joined cleanly");
+        assert!(report.aborted.is_empty(), "no aborts on clean shutdown");
+        assert!(report.panicked.is_empty(), "no panics");
+
+        // No further ticks after shutdown
+        let after = counter.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            after,
+            "no ticks after shutdown"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_aborts_slow_job_after_grace() {
+        let work_completed = Arc::new(AtomicBool::new(false));
+        let wc = work_completed.clone();
+
+        let mut jobs = JobSet::new();
+        jobs.periodic(
+            "slow_job",
+            Schedule::new(Duration::from_secs(10))
+                .with_first_tick(FirstTick::Immediate)
+                .with_jitter(0.0),
+            job_fn(move |_ct| {
+                let wc = wc.clone();
+                async move {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    wc.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            }),
+        );
+
+        // Let the immediate tick start its 60s sleep
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        // 5s grace < 60s sleep → must abort
+        let report = jobs.shutdown(Duration::from_secs(5)).await;
+        assert_eq!(report.aborted, vec!["slow_job"]);
+        assert!(report.clean.is_empty());
+        assert!(report.panicked.is_empty());
+
+        // Advance well past when the work would have completed naturally.
+        // If the abort succeeded, work_completed stays false.
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        assert!(
+            !work_completed.load(Ordering::SeqCst),
+            "slow job should have been aborted, not completed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_reports_panicked_job() {
+        struct Boom;
+        impl PeriodicJob for Boom {
+            async fn tick(&mut self, _ct: CancellationToken) -> Result<(), BoxError> {
+                panic!("boom in tick");
+            }
+        }
+
+        let mut jobs = JobSet::new();
+        jobs.periodic(
+            "boom",
+            Schedule::new(Duration::from_secs(10))
+                .with_first_tick(FirstTick::Immediate)
+                .with_jitter(0.0),
+            Boom,
+        );
+
+        // Let the immediate tick run and panic.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        let report = jobs.shutdown(Duration::from_secs(5)).await;
+        assert_eq!(report.panicked, vec!["boom"]);
+        assert!(report.clean.is_empty());
+        assert!(report.aborted.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_classifies_each_job_by_its_own_outcome() {
+        let mut jobs = JobSet::new();
+        // Fast: its single tick finishes well within the grace window.
+        jobs.periodic(
+            "fast",
+            Schedule::new(Duration::from_secs(100))
+                .with_first_tick(FirstTick::Immediate)
+                .with_jitter(0.0),
+            job_fn(|_ct| async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(())
+            }),
+        );
+        // Slow: its single tick outlasts the grace window.
+        jobs.periodic(
+            "slow",
+            Schedule::new(Duration::from_secs(100))
+                .with_first_tick(FirstTick::Immediate)
+                .with_jitter(0.0),
+            job_fn(|_ct| async move {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(())
+            }),
+        );
+
+        // Let both immediate ticks start.
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        // Each job is classified by its own outcome — the slow job does
+        // not drag the fast one into `aborted`. This guards against the
+        // old set-difference reconciliation that mislabeled jobs.
+        let report = jobs.shutdown(Duration::from_secs(5)).await;
+        assert_eq!(report.clean, vec!["fast"], "fast finished within grace");
+        assert_eq!(report.aborted, vec!["slow"], "slow aborted at grace");
+        assert!(report.panicked.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_empty_set_returns_immediately() {
+        let jobs = JobSet::new();
+        // Long grace — but with no handles, shutdown should return at t=0.
+        let report = tokio::time::timeout(
+            Duration::from_millis(1),
+            jobs.shutdown(Duration::from_secs(60)),
+        )
+        .await
+        .expect("empty shutdown should not block");
+        assert!(report.clean.is_empty());
+        assert!(report.aborted.is_empty());
+        assert!(report.panicked.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn task_receives_cancellation_token_and_observes_shutdown() {
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_for_task = exited.clone();
+
+        let mut jobs = JobSet::new();
+        jobs.task("listener", move |ct| {
+            let exited = exited_for_task;
+            async move {
+                ct.cancelled().await;
+                exited.store(true, Ordering::SeqCst);
+            }
+        });
+
+        // Task is sleeping on cancellation; shouldn't have exited yet.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(!exited.load(Ordering::SeqCst), "task waiting on token");
+
+        let report = jobs.shutdown(Duration::from_secs(5)).await;
+        assert!(exited.load(Ordering::SeqCst), "task exited after cancel");
+        assert_eq!(report.clean, vec!["listener"]);
+        assert!(report.aborted.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drop_without_shutdown_cancels_token() {
+        // Capture the token from the set so we can observe its state
+        // after the set is dropped.
+        let token = {
+            let mut jobs = JobSet::new();
+            let token = jobs.cancellation_token();
+            jobs.task("listener", move |ct| async move {
+                ct.cancelled().await;
+            });
+            // Drop `jobs` here — the Drop guard cancels the token, and
+            // the inner JoinSet aborts the still-running task (hard
+            // abort, no graceful join).
+            token
+        };
+
+        // Token is cancelled synchronously inside Drop.
+        assert!(token.is_cancelled(), "Drop guard should cancel the token");
+    }
+}
+
