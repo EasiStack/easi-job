@@ -1,0 +1,18 @@
+[package]
+name = "easi-job"
+version = "0.1.0"
+edition = "2024"
+description = "In-process periodic-job primitive (Schedule + JobSet) with graceful shutdown. Not a queue."
+authors = ["EasiStack"]
+license = "MIT"
+repository = "https://github.com/EasiStackDev/easi-job"
+documentation = "https://docs.rs/easi-job"
+readme = "README.md"
+keywords = ["tokio", "periodic", "background-job"]
+categories = ["asynchronous", "concurrency"]
+
+[dependencies]
+tokio = { version = "1.52", features = ["rt", "macros", "time", "sync"] }
+tokio-util = {version = "0.7", features = ["rt"] }
+tracing = "0.1"
+fastrand = "2.3"
