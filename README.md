@@ -2,12 +2,11 @@
 In-process periodic-job primitive with graceful shutdown.
 
 `easi-job` runs recurring background work inside your async process and stops
-it cleanly. You register jobs on a `JobSet` — each one either a **periodic**
-job that ticks on a fixed cadence, or a long-running **task** — and on shutdown
+it cleanly. You register jobs on a `JobSet`. Each one either a **periodic**
+job that ticks on a fixed cadence, or a long-running **task**. On shutdown
 the set cancels them all, waits a grace period for in-flight ticks to drain,
 and reports which finished cleanly and which had to be aborted. It's built for
-the everyday server need: a handful of in-process maintenance loops (cache
-sweeps, expiry cleanups, reconnect loops) that should start with the process
+the everyday server needs, like cleanup tasks that should start with the process
 and drain gracefully on Ctrl-C.
 
 
