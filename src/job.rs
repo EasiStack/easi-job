@@ -179,6 +179,8 @@ fn jittered(base: Duration, fraction: f32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[test]
     fn jittered_zero_fraction_returns_base() {
@@ -209,4 +211,243 @@ mod tests {
         }
     }
 
+    /// Spawn `run_periodic` and return the counter + cancel token.
+    /// Caller drives virtual time via `tokio::time::sleep`.
+    fn spawn_counting(
+        schedule: Schedule,
+    ) -> (
+        Arc<AtomicUsize>,
+        CancellationToken,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let token = CancellationToken::new();
+        let counter_for_work = counter.clone();
+        let token_for_task = token.clone();
+        let job = job_fn(move |_ct| {
+            let c = counter_for_work.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+        let handle = tokio::spawn(run_periodic("test", schedule, token_for_task, job));
+        (counter, token, handle)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn skip_immediate_first_tick_at_one_period() {
+        let (counter, token, handle) =
+            spawn_counting(Schedule::new(Duration::from_secs(10)).with_jitter(0.0));
+
+        tokio::time::sleep(Duration::from_secs(9)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "no tick before t=10");
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "first tick at t=10");
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "second tick at t=20");
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn immediate_first_tick_at_t_zero() {
+        let (counter, token, handle) = spawn_counting(
+            Schedule::new(Duration::from_secs(10))
+                .with_first_tick(FirstTick::Immediate)
+                .with_jitter(0.0),
+        );
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "immediate tick at t=0");
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "second tick at t=10");
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn after_first_tick_at_specified_duration() {
+        let (counter, token, handle) = spawn_counting(
+            Schedule::new(Duration::from_secs(10))
+                .with_first_tick(FirstTick::After(Duration::from_secs(3)))
+                .with_jitter(0.0),
+        );
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "no tick before initial wait"
+        );
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "first tick at t=3");
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "second tick at t=13");
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_during_sleep_breaks_promptly() {
+        let (counter, token, handle) =
+            spawn_counting(Schedule::new(Duration::from_secs(60)).with_jitter(0.0));
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        token.cancel();
+        // Cancellation arm of select! resolves immediately; no time
+        // advance needed for the task to finish.
+        handle.await.unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_during_work_lets_work_finish() {
+        let work_started = Arc::new(AtomicBool::new(false));
+        let work_completed = Arc::new(AtomicBool::new(false));
+        let token = CancellationToken::new();
+
+        let ws = work_started.clone();
+        let wc = work_completed.clone();
+        let token_for_task = token.clone();
+        let job = job_fn(move |_ct| {
+            let ws = ws.clone();
+            let wc = wc.clone();
+            async move {
+                ws.store(true, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                wc.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+        let handle = tokio::spawn(run_periodic(
+            "test",
+            Schedule::new(Duration::from_secs(10))
+                .with_first_tick(FirstTick::Immediate)
+                .with_jitter(0.0),
+            token_for_task,
+            job,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(work_started.load(Ordering::SeqCst), "work started");
+        assert!(!work_completed.load(Ordering::SeqCst), "work still running");
+
+        token.cancel();
+
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(
+            work_completed.load(Ordering::SeqCst),
+            "work runs to completion despite cancel — driver does not abort it"
+        );
+
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn error_in_work_continues_loop() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let token = CancellationToken::new();
+        let counter_for_work = counter.clone();
+        let token_for_task = token.clone();
+        let job = job_fn(move |_| {
+            let c = counter_for_work.clone();
+            async move {
+                let n = c.fetch_add(1, Ordering::SeqCst);
+                if n.is_multiple_of(2) {
+                    Err::<(), BoxError>("simulated".into())
+                } else {
+                    Ok(())
+                }
+            }
+        });
+        let handle = tokio::spawn(run_periodic(
+            "test",
+            Schedule::new(Duration::from_secs(10))
+                .with_first_tick(FirstTick::Immediate)
+                .with_jitter(0.0),
+            token_for_task,
+            job,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "first tick (errored)");
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 2, "second tick after error");
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 3, "third tick");
+
+        token.cancel();
+        handle.await.unwrap();
+    }
+
+    /// A `PeriodicJob` impl keeps mutable state across ticks via
+    /// `&mut self`. No `Arc`/atomics. We mirror the count into a shared
+    /// atomic only so the test thread can observe it.
+    #[tokio::test(start_paused = true)]
+    async fn trait_job_holds_state_across_ticks() {
+        struct Counting {
+            ticks: usize,
+            mirror: Arc<AtomicUsize>,
+        }
+
+        impl PeriodicJob for Counting {
+            async fn tick(&mut self, _ct: CancellationToken) -> Result<(), BoxError> {
+                self.ticks += 1;
+                self.mirror.store(self.ticks, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let mirror = Arc::new(AtomicUsize::new(0));
+        let token = CancellationToken::new();
+        let token_for_task = token.clone();
+        let job = Counting {
+            ticks: 0,
+            mirror: mirror.clone(),
+        };
+        let handle = tokio::spawn(async move {
+            run_periodic(
+                "test",
+                Schedule::new(Duration::from_secs(10))
+                    .with_first_tick(FirstTick::Immediate)
+                    .with_jitter(0.0),
+                token_for_task,
+                job,
+            )
+            .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(mirror.load(Ordering::SeqCst), 1, "first tick");
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(
+            mirror.load(Ordering::SeqCst),
+            2,
+            "state carried to second tick"
+        );
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(
+            mirror.load(Ordering::SeqCst),
+            3,
+            "state carried to third tick"
+        );
+
+        token.cancel();
+        handle.await.unwrap();
+    }
 }
