@@ -174,3 +174,39 @@ fn jittered(base: Duration, fraction: f32) -> Duration {
     let secs = base.as_secs_f64() * f64::from(multiplier);
     Duration::from_secs_f64(secs.max(0.0))
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jittered_zero_fraction_returns_base() {
+        let base = Duration::from_secs(100);
+        assert_eq!(jittered(base, 0.0), base);
+        assert_eq!(jittered(base, -0.5), base);
+    }
+
+    #[test]
+    fn jittered_stays_within_bounds() {
+        let base = Duration::from_secs(100);
+        for _ in 0..1000 {
+            let r = jittered(base, 0.1);
+            let secs = r.as_secs_f64();
+            assert!(secs >= 90.0, "{secs} below lower bound");
+            assert!(secs <= 110.0, "{secs} above upper bound");
+        }
+    }
+
+    #[test]
+    fn jittered_clamps_fraction_above_one() {
+        let base = Duration::from_secs(100);
+        for _ in 0..100 {
+            let r = jittered(base, 5.0);
+            let secs = r.as_secs_f64();
+            assert!(secs >= 0.0);
+            assert!(secs <= 200.0);
+        }
+    }
+
+}
