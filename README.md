@@ -10,6 +10,7 @@
 In-process periodic-job primitive with graceful shutdown.
 
 [![Crates.io](https://img.shields.io/crates/v/easi-job)](https://crates.io/crates/easi-job)
+[![Documentation](https://docs.rs/easi-job/badge.svg)][docs]
 
 `easi-job` runs recurring background work inside your async process and stops
 it cleanly. You register jobs on a `JobSet`. Each one either a **periodic**
