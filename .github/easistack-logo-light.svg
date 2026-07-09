@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg width="100%" height="100%" viewBox="0 0 372 100" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xml:space="preserve" xmlns:serif="http://www.serif.com/" style="fill-rule:evenodd;clip-rule:evenodd;stroke-linejoin:round;stroke-miterlimit:2;">
+    <g transform="matrix(0.76,0,0,0.76,4,12)">
+        <g transform="matrix(1,0,-0.32492,1,30.1224,-2.00954)">
+            <path d="M86,29.5C86,25.361 82.639,22 78.5,22L41.5,22C37.361,22 34,25.361 34,29.5C34,33.639 37.361,37 41.5,37L78.5,37C82.639,37 86,33.639 86,29.5Z" style="fill:rgb(0,150,197);fill-opacity:0.5;"/>
+            <path d="M86,51.5C86,47.361 82.639,44 78.5,44L21.5,44C17.361,44 14,47.361 14,51.5C14,55.639 17.361,59 21.5,59L78.5,59C82.639,59 86,55.639 86,51.5Z" style="fill:rgb(0,150,197);fill-opacity:0.76;"/>
+            <path d="M86,73.5C86,69.361 82.639,66 78.5,66L49.5,66C45.361,66 42,69.361 42,73.5C42,77.639 45.361,81 49.5,81L78.5,81C82.639,81 86,77.639 86,73.5Z" style="fill:rgb(0,150,197);"/>
+        </g>
+        <g transform="matrix(1.31579,0,0,1.31579,-0.749166,40.9502)">
+            <text x="86.81px" y="25.091px" style="font-family:'Poppins-SemiBold', 'Poppins';font-weight:600;font-size:48px;fill:rgb(44,47,55);">easi</text>
+        </g>
+        <g transform="matrix(1.31579,0,0,1.31579,138.892,40.9502)">
+            <text x="86.81px" y="25.091px" style="font-family:'Poppins-Regular', 'Poppins';font-size:53px;fill:rgb(0,150,197);">Stack</text>
+        </g>
+    </g>
+</svg>
