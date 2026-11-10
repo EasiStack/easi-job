@@ -13,8 +13,9 @@ use crate::schedule::Schedule;
 ///
 /// `aborted` and `panicked` being non-empty are alert-worthy signals;
 /// `aborted` means a job didn't finish its current tick within the
-/// shutdown grace, and `panicked` means a tick body panicked at some
-/// point during the run.
+/// shutdown grace, and `panicked` means the body of a job registered with
+/// [`JobSet::task`] panicked at some point during the run. A periodic
+/// job's tick that panics is caught and logged, and the job goes on.
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct ShutdownReport {
@@ -26,8 +27,10 @@ pub struct ShutdownReport {
     /// are also logged as `warn!(job, "aborted after shutdown grace")`
     /// at abort time.
     pub aborted: Vec<&'static str>,
-    /// Jobs whose tick body panicked. The names are also logged as
-    /// `error!(job, "panicked")` at join time.
+    /// Jobs registered with [`JobSet::task`] whose body panicked. The
+    /// names are also logged as `error!(job, "panicked")` at join time. A
+    /// periodic job's tick that panics is caught instead. It's logged as
+    /// `error!(job, panic, "tick panicked")` and the next tick runs.
     pub panicked: Vec<&'static str>,
 }
 
@@ -83,8 +86,10 @@ impl JobSet {
     }
 
     /// Spawn a periodic job under `name`, driven on the cadence described
-    /// by `schedule`. Errors are logged `error!(job = name, "tick failed")`
-    /// and the loop continues.
+    /// by `schedule`. A tick that returns `Err` is logged
+    /// `error!(job = name, "tick failed")`, and one that panics is logged
+    /// `error!(job = name, panic, "tick panicked")`. Either way the loop
+    /// continues.
     ///
     /// `name` is the identifier emitted as `job = "<name>"` in every log
     /// line (and in the [`ShutdownReport`]) — pick a snake_case identifier,
@@ -125,8 +130,9 @@ impl JobSet {
     /// Cancel all jobs and wait up to `grace` for them to finish.
     /// Any job still running after grace gets `JoinHandle::abort()`
     /// and a `warn!(job, "aborted after shutdown grace")` log line.
-    /// Panics inside a job's future are logged
-    /// `error!(job, "panicked")`.
+    /// A [`task`](Self::task) whose body panicked is logged
+    /// `error!(job, "panicked")`. A periodic job's tick panics were
+    /// already caught and logged by its driver as they happened.
     ///
     /// Returns a [`ShutdownReport`] classifying each job. The report
     /// can be discarded (`let _ = jobs.shutdown(grace).await;`) for
@@ -228,7 +234,6 @@ impl Drop for JobSet {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,8 +332,10 @@ mod tests {
         );
     }
 
+    /// A task that panics is reported so. A periodic job whose tick
+    /// panics is caught, runs on, and shuts down clean.
     #[tokio::test(start_paused = true)]
-    async fn shutdown_reports_panicked_job() {
+    async fn shutdown_reports_a_panicked_task_and_not_a_periodic_job() {
         struct Boom;
         impl PeriodicJob for Boom {
             async fn tick(&mut self, _ct: CancellationToken) -> Result<(), BoxError> {
@@ -338,19 +345,22 @@ mod tests {
 
         let mut jobs = JobSet::new();
         jobs.periodic(
-            "boom",
+            "ticks",
             Schedule::new(Duration::from_secs(10))
                 .with_first_tick(FirstTick::Immediate)
                 .with_jitter(0.0),
             Boom,
         );
+        jobs.task("boom", |_token| async move {
+            panic!("boom in task");
+        });
 
-        // Let the immediate tick run and panic.
+        // Let the immediate tick and the task run, and panic.
         tokio::time::sleep(Duration::from_millis(1)).await;
 
         let report = jobs.shutdown(Duration::from_secs(5)).await;
         assert_eq!(report.panicked, vec!["boom"]);
-        assert!(report.clean.is_empty());
+        assert_eq!(report.clean, vec!["ticks"]);
         assert!(report.aborted.is_empty());
     }
 
@@ -451,4 +461,3 @@ mod tests {
         assert!(token.is_cancelled(), "Drop guard should cancel the token");
     }
 }
-

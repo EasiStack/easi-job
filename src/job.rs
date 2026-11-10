@@ -34,8 +34,11 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// }
 /// ```
 ///
-/// Stateless jobs can implement the trait when you want a named, 
+/// Stateless jobs can implement the trait when you want a named,
 /// unit-testable type or cross-tick mutable state.
+///
+/// A tick that panics is caught and logged by the driver, and the next
+/// tick runs on the same `self`, in whatever state the panic left it.
 ///
 /// The returned future must be `Send` so the driver can run on the
 /// multi-threaded runtime; an `async fn` body satisfies this as long as
@@ -92,7 +95,8 @@ where
 ///
 /// 1. Apply the first-tick policy (initial wait, possibly zero).
 /// 2. Loop: call `job.tick(child_token)`, log outcome, sleep
-///    every jitter, repeat. The tick future is *not* aborted by
+///    every jitter, repeat. A tick that returns `Err` or panics is
+///    logged and the loop goes on. The tick future is *not* aborted by
 ///    the driver on cancellation, it runs to completion. The job's
 ///    tick body can `select!` on the child token to opt into
 ///    mid-tick cancellation.
@@ -124,8 +128,8 @@ pub(crate) async fn run_periodic<J>(
 
     if !initial_wait.is_zero() {
         select! {
-            // `biased` disabled the default random polling order. Instead it polls 
-            // the branches in the order they are written, giving priority to the 
+            // `biased` disabled the default random polling order. Instead it polls
+            // the branches in the order they are written, giving priority to the
             // first one.
             biased;
             // stop if cancellation triggered straight away
@@ -139,14 +143,19 @@ pub(crate) async fn run_periodic<J>(
     }
 
     loop {
-        match job.tick(token.child_token()).await {
-            Ok(()) => tracing::trace!(job = name, "ok"),
+        match caught(async { job.tick(token.child_token()).await }).await {
+            Ok(Ok(())) => tracing::trace!(job = name, "ok"),
             // Pass the error as `&dyn Error` so tracing records the full
             // `.source()` chain, not just the top-level Display.
-            Err(e) => tracing::error!(
+            Ok(Err(e)) => tracing::error!(
                 job = name,
                 error = &*e as &(dyn std::error::Error + 'static),
                 "tick failed"
+            ),
+            Err(panic) => tracing::error!(
+                job = name,
+                panic = panic_words(panic.as_ref()),
+                "tick panicked"
             ),
         }
 
@@ -160,6 +169,30 @@ pub(crate) async fn run_periodic<J>(
     tracing::info!(job = name, "stopped");
 }
 
+/// A panic is caught in work: `Err` with the panic's payload, where
+/// awaiting it alone would unwind through the driver. Each poll runs inside
+/// `catch_unwind`; the future is never polled again after it panics.
+async fn caught<F: Future>(work: F) -> Result<F::Output, Box<dyn std::any::Any + Send>> {
+    let mut work = std::pin::pin!(work);
+    std::future::poll_fn(move |cx| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work.as_mut().poll(cx))) {
+            Ok(std::task::Poll::Ready(out)) => std::task::Poll::Ready(Ok(out)),
+            Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
+            Err(payload) => std::task::Poll::Ready(Err(payload)),
+        }
+    })
+    .await
+}
+
+/// A panic's message, when it carries one (`panic!` with words does).
+fn panic_words(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("(no message)")
+}
+
 /// Apply `fraction` jitter to `base` using a non-cryptographic RNG
 /// (`fastrand`). Clamps `fraction` to `[0.0, 1.0]` and the result to
 /// `>= 0`.
@@ -168,13 +201,12 @@ fn jittered(base: Duration, fraction: f32) -> Duration {
     if fraction == 0.0 {
         return base;
     }
-    
+
     let r = fastrand::f32().mul_add(2.0, -1.0);
     let multiplier = r.mul_add(fraction, 1.0);
     let secs = base.as_secs_f64() * f64::from(multiplier);
     Duration::from_secs_f64(secs.max(0.0))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -391,6 +423,84 @@ mod tests {
 
         token.cancel();
         handle.await.unwrap();
+    }
+
+    /// A tick that panics is caught: the loop goes on, and the next tick
+    /// runs on schedule.
+    #[tokio::test(start_paused = true)]
+    async fn a_panic_in_work_continues_loop() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let token = CancellationToken::new();
+        let counter_for_work = counter.clone();
+        let token_for_task = token.clone();
+        let job = job_fn(move |_| {
+            let c = counter_for_work.clone();
+            async move {
+                if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("a tick that panics");
+                }
+                Ok::<(), BoxError>(())
+            }
+        });
+        let handle = tokio::spawn(run_periodic(
+            "test",
+            Schedule::new(Duration::from_secs(10))
+                .with_first_tick(FirstTick::Immediate)
+                .with_jitter(0.0),
+            token_for_task,
+            job,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "first tick (panicked)");
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "second tick after the panic"
+        );
+
+        token.cancel();
+        handle.await.expect("the driver never ended by the panic");
+    }
+
+    /// A panic in a `job_fn` closure before its `async` block happens when
+    /// the tick is called, not when its future is polled. It's caught too.
+    /// The loop goes on, and the next tick runs on schedule.
+    #[tokio::test(start_paused = true)]
+    async fn a_panic_before_the_async_block_continues_loop() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let token = CancellationToken::new();
+        let counter_for_work = counter.clone();
+        let token_for_task = token.clone();
+        let job = job_fn(move |_| {
+            if counter_for_work.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("a panic before the async block");
+            }
+            async { Ok::<(), BoxError>(()) }
+        });
+        let handle = tokio::spawn(run_periodic(
+            "test",
+            Schedule::new(Duration::from_secs(10))
+                .with_first_tick(FirstTick::Immediate)
+                .with_jitter(0.0),
+            token_for_task,
+            job,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "first tick (panicked)");
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "second tick after the panic"
+        );
+
+        token.cancel();
+        handle.await.expect("the driver never ended by the panic");
     }
 
     /// A `PeriodicJob` impl keeps mutable state across ticks via

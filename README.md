@@ -182,9 +182,12 @@ Every line emitted by the runner carries `job = "<name>"`:
 
 - `trace!(job, "ok")` — successful tick
 - `error!(job, error, "tick failed")` — tick returned `Err`
+- `error!(job, panic, "tick panicked")` — tick panicked; the job goes
+  on and the next tick runs on schedule
 - `info!(job, "stopped")` — loop exited cleanly after cancel
 - `warn!(job, "aborted after shutdown grace")` — abort fallback
-- `error!(job, "panicked")` — tick body panicked
+- `error!(job, "panicked")` — a `task`'s body panicked (reported in
+  `ShutdownReport.panicked`)
 - `warn!(handles, "JobSet dropped without shutdown — …")` — Drop
   guard fired (i.e. caller forgot to await `shutdown`)
 
