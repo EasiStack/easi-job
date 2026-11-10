@@ -1,5 +1,17 @@
+<p align="center">  
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/EasiStack/easi-job/refs/heads/main/.github/easistack-logo-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/EasiStack/easi-job/refs/heads/main/.github/easistack-logo-light.svg">
+    <img alt="easiStack" src="https://raw.githubusercontent.com/EasiStack/easi-job/refs/heads/main/.github/easistack-logo-light.svg" width="350" height="70" style="max-width: 100%;">
+  </picture>
+</p>
+
 # easi-job
 In-process periodic-job primitive with graceful shutdown.
+
+[![Crates.io](https://img.shields.io/crates/v/easi-job)](https://crates.io/crates/easi-job)
+[![Documentation](https://docs.rs/easi-job/badge.svg)](https://docs.rs/easi-job)
+
 
 `easi-job` runs recurring background work inside your async process and stops
 it cleanly. You register jobs on a `JobSet`. Each one either a **periodic**
